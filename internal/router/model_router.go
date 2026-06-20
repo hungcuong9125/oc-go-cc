@@ -5,7 +5,7 @@ package router
 import (
 	"fmt"
 
-	"oc-go-cc/internal/config"
+	"github.com/routatic/proxy/internal/config"
 )
 
 // ModelRouter handles model selection based on scenarios.
@@ -16,6 +16,16 @@ type ModelRouter struct {
 // NewModelRouter creates a new model router.
 func NewModelRouter(atomic *config.AtomicConfig) *ModelRouter {
 	return &ModelRouter{atomic: atomic}
+}
+
+// isRespectRequestedModel returns true when the client-specified model should be
+// used as the primary routing target.  nil (unset in config) defaults to true;
+// an explicit *false from the user config is honoured.
+func isRespectRequestedModel(cfg *config.Config) bool {
+	if cfg.RespectRequestedModel == nil {
+		return true // default when not explicitly set
+	}
+	return *cfg.RespectRequestedModel
 }
 
 // RouteResult contains the selected model and fallback chain.
@@ -29,7 +39,7 @@ type RouteResult struct {
 // scenario-based routing. Returns the route result and true if it matched,
 // or zero value and false if scenario routing should proceed normally.
 func (r *ModelRouter) resolveRequestedModel(cfg *config.Config, requestedModel string) (RouteResult, bool) {
-	if !cfg.RespectRequestedModel || requestedModel == "" {
+	if !isRespectRequestedModel(cfg) || requestedModel == "" {
 		return RouteResult{}, false
 	}
 
@@ -138,11 +148,11 @@ func (rr *RouteResult) GetModelChain() []config.ModelConfig {
 // RouteForStreaming determines which model to use for streaming requests.
 // Prioritizes fast TTFT (time-to-first-token) over capability.
 // If respect_requested_model is enabled and requestedModel is provided, it overrides scenario-based routing.
-func (r *ModelRouter) RouteForStreaming(messages []MessageContent, tokenCount int, requestedModel string) RouteResult {
+func (r *ModelRouter) RouteForStreaming(messages []MessageContent, tokenCount int, requestedModel string) (RouteResult, error) {
 	cfg := r.atomic.Get()
 
 	if result, ok := r.resolveRequestedModel(cfg, requestedModel); ok {
-		return result
+		return result, nil
 	}
 
 	// Otherwise, use scenario-based routing for streaming
@@ -158,6 +168,9 @@ func (r *ModelRouter) RouteForStreaming(messages []MessageContent, tokenCount in
 			primary = cfg.Models["default"]
 		}
 	}
+	if primary.ModelID == "" {
+		return RouteResult{}, fmt.Errorf("no model configured for streaming; neither scenario %q, \"fast\", nor \"default\" exist in models map", result.Scenario)
+	}
 
 	// Get fallbacks for scenario
 	fallbacks := cfg.Fallbacks[string(result.Scenario)]
@@ -170,5 +183,5 @@ func (r *ModelRouter) RouteForStreaming(messages []MessageContent, tokenCount in
 		Primary:   primary,
 		Fallbacks: fallbacks,
 		Scenario:  result.Scenario,
-	}
+	}, nil
 }

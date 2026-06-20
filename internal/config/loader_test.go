@@ -214,6 +214,69 @@ func TestEnvOverrides(t *testing.T) {
 	}
 }
 
+func TestEnvOverrides_RoutaticProxyTakesPrecedenceOverLegacy(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	if err := os.WriteFile(cfgPath, []byte(`{"api_key": "file-key"}`), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	_ = os.Setenv("ROUTATIC_PROXY_CONFIG", cfgPath)
+	_ = os.Setenv("OC_GO_CC_CONFIG", filepath.Join(dir, "legacy.json"))
+	_ = os.Setenv("ROUTATIC_PROXY_API_KEY", "new-key")
+	_ = os.Setenv("OC_GO_CC_API_KEY", "legacy-key")
+	_ = os.Setenv("ROUTATIC_PROXY_HOST", "new-host")
+	_ = os.Setenv("OC_GO_CC_HOST", "legacy-host")
+	defer func() {
+		_ = os.Unsetenv("ROUTATIC_PROXY_CONFIG")
+		_ = os.Unsetenv("OC_GO_CC_CONFIG")
+		_ = os.Unsetenv("ROUTATIC_PROXY_API_KEY")
+		_ = os.Unsetenv("OC_GO_CC_API_KEY")
+		_ = os.Unsetenv("ROUTATIC_PROXY_HOST")
+		_ = os.Unsetenv("OC_GO_CC_HOST")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.APIKey != "new-key" {
+		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "new-key")
+	}
+	if cfg.Host != "new-host" {
+		t.Errorf("Host = %q, want %q", cfg.Host, "new-host")
+	}
+}
+
+func TestInterpolateEnvVars_NewPlaceholderAcceptsLegacyEnv(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	if err := os.WriteFile(cfgPath, []byte(`{"api_key": "${ROUTATIC_PROXY_API_KEY}"}`), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	_ = os.Setenv("ROUTATIC_PROXY_CONFIG", cfgPath)
+	_ = os.Unsetenv("ROUTATIC_PROXY_API_KEY")
+	_ = os.Setenv("OC_GO_CC_API_KEY", "legacy-key")
+	defer func() {
+		_ = os.Unsetenv("ROUTATIC_PROXY_CONFIG")
+		_ = os.Unsetenv("ROUTATIC_PROXY_API_KEY")
+		_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.APIKey != "legacy-key" {
+		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "legacy-key")
+	}
+}
+
 func TestEnvOverrides_OC_GO_CC_API_KEY_OverridesAPIKeys(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
@@ -276,6 +339,10 @@ func TestDefaults(t *testing.T) {
 	if cfg.OpenCodeGo.TimeoutMs != defaultTimeoutMs {
 		t.Errorf("OpenCodeGo.TimeoutMs = %d, want %d", cfg.OpenCodeGo.TimeoutMs, defaultTimeoutMs)
 	}
+	if cfg.OpenCodeGo.StreamTimeoutMs != defaultTimeoutMs {
+		t.Errorf("OpenCodeGo.StreamTimeoutMs = %d, want %d (should default to TimeoutMs when unset)",
+			cfg.OpenCodeGo.StreamTimeoutMs, defaultTimeoutMs)
+	}
 	if cfg.OpenCodeZen.BaseURL != defaultZenBaseURL {
 		t.Errorf("OpenCodeZen.BaseURL = %q, want %q", cfg.OpenCodeZen.BaseURL, defaultZenBaseURL)
 	}
@@ -290,6 +357,10 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.OpenCodeZen.TimeoutMs != defaultTimeoutMs {
 		t.Errorf("OpenCodeZen.TimeoutMs = %d, want %d", cfg.OpenCodeZen.TimeoutMs, defaultTimeoutMs)
+	}
+	if cfg.OpenCodeZen.StreamTimeoutMs != defaultTimeoutMs {
+		t.Errorf("OpenCodeZen.StreamTimeoutMs = %d, want %d (should default to TimeoutMs when unset)",
+			cfg.OpenCodeZen.StreamTimeoutMs, defaultTimeoutMs)
 	}
 	if cfg.Logging.Level != defaultLogLevel {
 		t.Errorf("LogLevel = %q, want %q", cfg.Logging.Level, defaultLogLevel)
@@ -561,5 +632,47 @@ func TestValidateAPIKeys_RejectsAllEmpty(t *testing.T) {
 	err := validate(cfg)
 	if err == nil {
 		t.Fatal("expected validation error for empty api_keys entry, got nil")
+	}
+}
+
+func TestDefaults_StreamingTimeoutFallback(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	cfgJSON := `{
+		"api_key": "test-key",
+		"opencode_go": {
+			"timeout_ms": 300000,
+			"streaming_timeout_ms": 600000
+		},
+		"opencode_zen": {
+			"timeout_ms": 300000,
+			"streaming_timeout_ms": 700000
+		}
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer func() { _ = os.Unsetenv("OC_GO_CC_CONFIG") }()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.OpenCodeGo.StreamingTimeoutMs != 600000 {
+		t.Errorf("OpenCodeGo.StreamingTimeoutMs = %d, want 600000", cfg.OpenCodeGo.StreamingTimeoutMs)
+	}
+	if cfg.OpenCodeGo.StreamTimeoutMs != 600000 {
+		t.Errorf("OpenCodeGo.StreamTimeoutMs = %d, want 600000 (should fallback to StreamingTimeoutMs)", cfg.OpenCodeGo.StreamTimeoutMs)
+	}
+
+	if cfg.OpenCodeZen.StreamingTimeoutMs != 700000 {
+		t.Errorf("OpenCodeZen.StreamingTimeoutMs = %d, want 700000", cfg.OpenCodeZen.StreamingTimeoutMs)
+	}
+	if cfg.OpenCodeZen.StreamTimeoutMs != 700000 {
+		t.Errorf("OpenCodeZen.StreamTimeoutMs = %d, want 700000 (should fallback to StreamingTimeoutMs)", cfg.OpenCodeZen.StreamTimeoutMs)
 	}
 }

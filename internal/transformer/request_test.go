@@ -3,11 +3,12 @@ package transformer
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
-	"oc-go-cc/internal/config"
-	"oc-go-cc/pkg/types"
+	"github.com/routatic/proxy/internal/config"
+	"github.com/routatic/proxy/pkg/types"
 )
 
 // TestTransformRequestRoundTripReasoning verifies that a DeepSeek response with
@@ -86,6 +87,7 @@ func TestTransformRequestRoundTripReasoning(t *testing.T) {
 	}
 	if assistantMsg == nil {
 		t.Fatal("assistant message not found in transformed request")
+		return
 	}
 
 	// Step 5: Verify reasoning_content is preserved.
@@ -967,6 +969,7 @@ func TestTransformRequestDeepSeekPlaceholderWithThinkingHistory(t *testing.T) {
 	}
 	if toolCallAssistant == nil {
 		t.Fatal("no assistant message with tool_calls found")
+		return
 	}
 	if toolCallAssistant.ReasoningContent == nil {
 		t.Fatal("ReasoningContent = nil, want non-nil placeholder for DeepSeek with thinking history")
@@ -1036,6 +1039,7 @@ func TestTransformRequestDeepSeekPlaceholderForTextOnlyAssistant(t *testing.T) {
 	}
 	if textOnlyAssistant == nil {
 		t.Fatal("expected two assistant messages in transformed request, found fewer")
+		return
 	}
 	if len(textOnlyAssistant.ToolCalls) != 0 {
 		t.Fatalf("text-only assistant message unexpectedly had tool_calls: %+v", textOnlyAssistant.ToolCalls)
@@ -1167,6 +1171,7 @@ func TestTransformRequestExtractsThinkingFromToolUseBlock(t *testing.T) {
 	}
 	if assistantMsg == nil {
 		t.Fatal("no assistant message in transformed request")
+		return
 	}
 	if assistantMsg.ReasoningContent == nil {
 		t.Fatal("ReasoningContent = nil, want non-nil (thinking on tool_use must round-trip)")
@@ -1521,6 +1526,61 @@ func TestTransformRequestStandardModelIgnoresThinkingAndEffort(t *testing.T) {
 	}
 	if openaiReq.Thinking != nil {
 		t.Fatalf("expected Thinking to be nil for standard model, got %s", string(openaiReq.Thinking))
+	}
+}
+
+func TestConstrainTemperature(t *testing.T) {
+	tests := []struct {
+		modelID string
+		input   float64
+		want    float64
+	}{
+		// kimi-k2.7-code forces temperature to 1.0
+		{modelID: "kimi-k2.7-code", input: 0.7, want: 1.0},
+		{modelID: "kimi-k2.7-code", input: 0.0, want: 1.0},
+		{modelID: "kimi-k2.7-code", input: 1.5, want: 1.0},
+
+		// Other kimi models are not constrained
+		{modelID: "kimi-k2.6", input: 0.7, want: 0.7},
+		{modelID: "kimi-k2.5", input: 0.5, want: 0.5},
+
+		// Other models are not constrained
+		{modelID: "minimax-m3", input: 0.7, want: 0.7},
+		{modelID: "deepseek-v4-pro", input: 0.5, want: 0.5},
+		{modelID: "glm-5.1", input: 0.3, want: 0.3},
+		{modelID: "qwen3.7-plus", input: 0.9, want: 0.9},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.modelID+"/"+fmt.Sprint(tt.input), func(t *testing.T) {
+			if got := constrainTemperature(tt.modelID, tt.input); got != tt.want {
+				t.Errorf("constrainTemperature(%q, %f) = %f, want %f", tt.modelID, tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTransformTools_HandlesWhitespaceNullSchema guards against a panic on
+// valid JSON that unmarshals to a nil map (e.g. " null " with decorative
+// whitespace). The fix is to fall back to the default schema when schemaObj
+// is nil after Unmarshal.
+func TestTransformTools_HandlesWhitespaceNullSchema(t *testing.T) {
+	transformer := NewRequestTransformer()
+	tools := []types.Tool{
+		{Name: "Bash", Description: "decorative null", InputSchema: json.RawMessage(` null `)},
+	}
+
+	result := transformer.transformTools(tools)
+	if got, want := len(result), 1; got != want {
+		t.Fatalf("len(result) = %d, want %d (whitespace-null schema should fall back, not panic)", got, want)
+	}
+
+	params := string(result[0].Function.Parameters)
+	if !strings.Contains(params, `"type":"object"`) {
+		t.Fatalf("whitespace-null schema should fall back to default object schema: %s", params)
+	}
+	if !strings.Contains(params, `"properties":{}`) {
+		t.Fatalf("whitespace-null schema should fall back to default properties: %s", params)
 	}
 }
 

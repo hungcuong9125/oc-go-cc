@@ -2,15 +2,17 @@
 
 ## Config File
 
-Location: `~/.config/oc-go-cc/config.json`
+Location: `~/.config/routatic-proxy/config.json`
 
-Override with `OC_GO_CC_CONFIG` environment variable.
+Override with `ROUTATIC_PROXY_CONFIG` environment variable.
+
+For migration, `~/.config/oc-go-cc/config.json` is loaded when the new config file does not exist, and every `OC_GO_CC_*` environment variable is still accepted as a fallback for its `ROUTATIC_PROXY_*` replacement.
 
 ## Full Config Reference
 
 ```json
 {
-  "api_key": "${OC_GO_CC_API_KEY}",
+  "api_key": "${ROUTATIC_PROXY_API_KEY}",
   "host": "127.0.0.1",
   "port": 3456,
   "hot_reload": false,
@@ -115,7 +117,7 @@ Override with `OC_GO_CC_CONFIG` environment variable.
 
 ## Providers
 
-oc-go-cc supports two providers for upstream API calls:
+routatic-proxy supports two providers for upstream API calls:
 
 ### OpenCode Go (`opencode-go`)
 
@@ -139,13 +141,15 @@ Environment variables override config file values. Config values also support `$
 
 | Variable                | Description                                 | Default                                          |
 | ----------------------- | ------------------------------------------- | ------------------------------------------------ |
-| `OC_GO_CC_API_KEY`      | OpenCode Go API key (**required**)          | —                                                |
-| `OC_GO_CC_CONFIG`       | Custom config file path                     | `~/.config/oc-go-cc/config.json`                 |
-| `OC_GO_CC_HOST`         | Proxy listen host                           | `127.0.0.1`                                      |
-| `OC_GO_CC_PORT`         | Proxy listen port                           | `3456`                                           |
-| `OC_GO_CC_OPENCODE_URL` | OpenCode Go API endpoint                    | `https://opencode.ai/zen/go/v1/chat/completions` |
-| `OC_GO_CC_OPENCODE_ZEN_URL` | OpenCode Zen API endpoint              | `https://opencode.ai/zen/v1/chat/completions`    |
-| `OC_GO_CC_LOG_LEVEL`    | Log level: `debug`, `info`, `warn`, `error` | `info`                                           |
+| `ROUTATIC_PROXY_API_KEY`      | OpenCode Go API key (**required**)          | —                                                |
+| `ROUTATIC_PROXY_CONFIG`       | Custom config file path                     | `~/.config/routatic-proxy/config.json`                 |
+| `ROUTATIC_PROXY_HOST`         | Proxy listen host                           | `127.0.0.1`                                      |
+| `ROUTATIC_PROXY_PORT`         | Proxy listen port                           | `3456`                                           |
+| `ROUTATIC_PROXY_OPENCODE_URL` | OpenCode Go API endpoint                    | `https://opencode.ai/zen/go/v1/chat/completions` |
+| `ROUTATIC_PROXY_OPENCODE_ZEN_URL` | OpenCode Zen API endpoint              | `https://opencode.ai/zen/v1/chat/completions`    |
+| `ROUTATIC_PROXY_LOG_LEVEL`    | Log level: `debug`, `info`, `warn`, `error` | `info`                                           |
+
+Legacy equivalents such as `OC_GO_CC_API_KEY`, `OC_GO_CC_CONFIG`, and `OC_GO_CC_PORT` continue to work. When both names are set, the `ROUTATIC_PROXY_*` value wins.
 
 ## Hot Reload
 
@@ -232,7 +236,7 @@ When a request arrives, the proxy checks `model_overrides[<model>]` **first**. I
 
 Each entry accepts the same fields as a `ModelConfig` (`provider`, `model_id`, `temperature`, `max_tokens`, `reasoning_effort`, `thinking`, etc.). `model_id` is required; `provider` must be `"opencode-go"` or `"opencode-zen"` (or omitted to inherit the default).
 
-See `oc-go-cc models` for the complete list of available Zen models across all endpoint types (Claude, GPT, Gemini, and free-tier).
+See `routatic-proxy models` for the complete list of available Zen models across all endpoint types (Claude, GPT, Gemini, and free-tier).
 
 ### Routing precedence
 
@@ -243,3 +247,49 @@ When a request arrives, the proxy selects a model chain using the following orde
 3. **Scenario routing** — fall back to the scenario chain (`default`, `background`, `think`, `complex`, `long_context`, `fast`).
 
 > **Trust model:** any client whose requests flow through the proxy can select from the configured `model_overrides` set without additional authentication. If you run the proxy as a shared service, treat `model_overrides` as a privileged allowlist.
+
+### Streaming Scenario Routing
+
+`enable_streaming_scenario_routing` controls whether streaming requests are evaluated by the full scenario router or routed directly to the `fast` scenario.
+
+> **Note for Claude Code `/review-code`, `/ultracode`, and multi-agent workflows**
+>
+> If you use Claude Code workflows that dispatch many subagents or produce many parallel tool calls, enable streaming scenario routing:
+>
+> ```json
+> {
+>   "enable_streaming_scenario_routing": true
+> }
+> ```
+>
+> Without this option, streaming requests are routed through the `fast` scenario even when the request is actually tool-heavy. This can route complex Claude Code workloads, such as `/review-code` with many `Agent` tool calls, to a fast model that may not handle parallel tool-call orchestration reliably.
+>
+> When enabled, streaming requests are evaluated by the same scenario router as non-streaming requests, allowing large or tool-heavy workloads to use `complex` or `long_context` models instead of always using the `fast` model.
+
+Recommended setup for Claude Code review workflows:
+
+```json
+{
+  "enable_streaming_scenario_routing": true,
+  "models": {
+    "fast": {
+      "provider": "opencode-go",
+      "model_id": "deepseek-v4-flash",
+      "max_tokens": 4096
+    },
+    "complex": {
+      "provider": "opencode-go",
+      "model_id": "minimax-m3",
+      "max_tokens": 8192
+    },
+    "long_context": {
+      "provider": "opencode-go",
+      "model_id": "minimax-m3",
+      "max_tokens": 16384,
+      "context_threshold": 80000
+    }
+  }
+}
+```
+
+Use the `fast` scenario for short/simple requests. Use `complex` or `long_context` for code review, multi-agent dispatch, large diffs, many tools, or long-context Claude Code sessions.

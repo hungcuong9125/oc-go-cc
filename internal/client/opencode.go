@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"oc-go-cc/internal/config"
-	"oc-go-cc/pkg/types"
+	"github.com/routatic/proxy/internal/config"
+	"github.com/routatic/proxy/pkg/types"
 )
 
 const (
@@ -54,14 +54,43 @@ func NewOpenCodeClient(atomic *config.AtomicConfig) *OpenCodeClient {
 	return &OpenCodeClient{
 		atomic: atomic,
 		httpClient: &http.Client{
-			Timeout:   0,
 			Transport: transport,
 		},
 	}
 }
 
+// StreamIdleTimeout returns the maximum gap between bytes on an active stream
+// for a model. The stream lives as long as data keeps flowing; only an idle
+// period longer than this value is treated as a stuck connection and aborted.
+// Go provider models use OpenCodeGo.StreamTimeoutMs; Zen models use
+// OpenCodeZen.StreamTimeoutMs. Falls back to 5 minutes if the config is
+// unavailable or the value is zero.
+func (c *OpenCodeClient) StreamIdleTimeout(modelConfig config.ModelConfig) time.Duration {
+	const fallback = 5 * time.Minute
+	if c == nil || c.atomic == nil {
+		return fallback
+	}
+	cfg := c.atomic.Get()
+	var ms int
+	if IsZen(modelConfig) {
+		ms = cfg.OpenCodeZen.StreamTimeoutMs
+	} else {
+		ms = cfg.OpenCodeGo.StreamTimeoutMs
+	}
+	if ms <= 0 {
+		ms = cfg.OpenCodeGo.TimeoutMs
+	}
+	if ms <= 0 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // RequestTimeout returns the provider timeout for a non-streaming attempt.
 func (c *OpenCodeClient) RequestTimeout(model config.ModelConfig) time.Duration {
+	if c == nil || c.atomic == nil {
+		return 5 * time.Minute
+	}
 	cfg := c.atomic.Get()
 	var timeoutMs int
 	if IsZen(model) {
@@ -77,6 +106,9 @@ func (c *OpenCodeClient) RequestTimeout(model config.ModelConfig) time.Duration 
 
 // StreamingTimeout returns the provider timeout for a streaming attempt.
 func (c *OpenCodeClient) StreamingTimeout(model config.ModelConfig) time.Duration {
+	if c == nil || c.atomic == nil {
+		return 5 * time.Minute
+	}
 	cfg := c.atomic.Get()
 	var timeoutMs int
 	if IsZen(model) {
@@ -97,14 +129,19 @@ func (c *OpenCodeClient) StreamingTimeout(model config.ModelConfig) time.Duratio
 }
 
 // IsAnthropicModel returns true if the model requires the Anthropic endpoint.
-// This includes both Go models (minimax, all qwen) and Zen models (claude, qwen3.7-max).
+// Most Go provider models use the Chat Completions transform path for broader
+// compatibility (tool format, message roles, etc.). Exceptions are models whose
+// upstream backends don't support the OpenAI Chat Completions format and only
+// accept Anthropic Messages format.
+//
+// Only Zen models use the raw Anthropic endpoint via ClassifyEndpoint.
 func IsAnthropicModel(modelID string) bool {
 	switch modelID {
 	case "minimax-m2.5", "minimax-m2.7", "minimax-m3",
 		"qwen3.5-plus", "qwen3.6-plus", "qwen3.7-plus", "qwen3.7-max":
 		return true
 	default:
-		return isZenAnthropicModel(modelID)
+		return false
 	}
 }
 

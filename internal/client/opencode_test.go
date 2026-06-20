@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"oc-go-cc/internal/config"
+	"github.com/routatic/proxy/internal/config"
 )
 
 func TestIsAnthropicModelOnlyRoutesNativeAnthropicModels(t *testing.T) {
@@ -14,17 +14,17 @@ func TestIsAnthropicModelOnlyRoutesNativeAnthropicModels(t *testing.T) {
 		want    bool
 	}{
 		{
-			name:    "minimax m2.5 uses anthropic endpoint",
+			name:    "minimax m2.5 uses anthropic endpoint on Go provider",
 			modelID: "minimax-m2.5",
 			want:    true,
 		},
 		{
-			name:    "minimax m2.7 uses anthropic endpoint",
+			name:    "minimax m2.7 uses anthropic endpoint on Go provider",
 			modelID: "minimax-m2.7",
 			want:    true,
 		},
 		{
-			name:    "minimax m3 uses anthropic endpoint",
+			name:    "minimax m3 uses anthropic endpoint on Go provider",
 			modelID: "minimax-m3",
 			want:    true,
 		},
@@ -64,44 +64,44 @@ func TestIsAnthropicModelOnlyRoutesNativeAnthropicModels(t *testing.T) {
 			want:    false,
 		},
 		{
-			name:    "qwen3.5-plus uses anthropic endpoint",
+			name:    "qwen3.5-plus uses anthropic endpoint on Go provider",
 			modelID: "qwen3.5-plus",
 			want:    true,
 		},
 		{
-			name:    "qwen3.6-plus uses anthropic endpoint",
+			name:    "qwen3.6-plus uses anthropic endpoint on Go provider",
 			modelID: "qwen3.6-plus",
 			want:    true,
 		},
 		{
-			name:    "qwen3.7-plus uses anthropic endpoint",
+			name:    "qwen3.7-plus uses anthropic endpoint on Go provider",
 			modelID: "qwen3.7-plus",
 			want:    true,
 		},
 		{
-			name:    "qwen3.7-max uses anthropic endpoint",
+			name:    "qwen3.7-max uses anthropic endpoint (no oa-compat support)",
 			modelID: "qwen3.7-max",
 			want:    true,
 		},
 		{
-			name:    "claude-sonnet-4-5 uses anthropic endpoint",
+			name:    "claude models use openai endpoint on Go provider",
 			modelID: "claude-sonnet-4-5",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "claude-opus-4-7 uses anthropic endpoint",
+			name:    "claude-opus-4-7 uses openai endpoint on Go provider",
 			modelID: "claude-opus-4-7",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "claude-haiku-4-5 uses anthropic endpoint",
+			name:    "claude-haiku-4-5 uses openai endpoint on Go provider",
 			modelID: "claude-haiku-4-5",
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "claude-3-5-haiku uses anthropic endpoint",
+			name:    "claude-3-5-haiku uses openai endpoint on Go provider",
 			modelID: "claude-3-5-haiku",
-			want:    true,
+			want:    false,
 		},
 	}
 
@@ -460,6 +460,55 @@ func TestNextAPIKey_ConcurrentSafety(t *testing.T) {
 		if seen[key] != expectedPerKey {
 			t.Errorf("key %q seen %d times, want %d", key, seen[key], expectedPerKey)
 		}
+	}
+}
+
+func TestStreamIdleTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		goMs     int
+		zenMs    int
+		provider string
+		wantDur  time.Duration
+	}{
+		{
+			name:     "Go provider uses OpenCodeGo.StreamTimeoutMs",
+			goMs:     120000, // 2 min
+			provider: "opencode-go",
+			wantDur:  120 * time.Second,
+		},
+		{
+			name:     "Zen provider uses OpenCodeZen.StreamTimeoutMs",
+			goMs:     100000,
+			zenMs:    600000, // 10 min
+			provider: "opencode-zen",
+			wantDur:  10 * time.Minute,
+		},
+		{
+			name:     "falls back to OpenCodeGo.TimeoutMs when StreamTimeoutMs is zero",
+			goMs:     300000, // 5 min
+			provider: "opencode-go",
+			wantDur:  5 * time.Minute,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				OpenCodeGo:  config.OpenCodeGoConfig{TimeoutMs: tt.goMs, StreamTimeoutMs: tt.goMs},
+				OpenCodeZen: config.OpenCodeZenConfig{TimeoutMs: tt.zenMs, StreamTimeoutMs: tt.zenMs},
+			}
+			// Fallback test: zero out StreamTimeoutMs for that provider.
+			if tt.name == "falls back to OpenCodeGo.TimeoutMs when StreamTimeoutMs is zero" {
+				cfg.OpenCodeGo.StreamTimeoutMs = 0
+			}
+			atomic := config.NewAtomicConfig(cfg, "/tmp/test-config.json")
+			c := &OpenCodeClient{atomic: atomic}
+			mc := config.ModelConfig{Provider: tt.provider, ModelID: "test-model"}
+			got := c.StreamIdleTimeout(mc)
+			if got != tt.wantDur {
+				t.Errorf("StreamIdleTimeout() = %v, want %v", got, tt.wantDur)
+			}
+		})
 	}
 }
 

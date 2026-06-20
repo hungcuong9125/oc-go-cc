@@ -5,18 +5,41 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
-	"oc-go-cc/pkg/types"
+	"github.com/routatic/proxy/pkg/types"
 )
 
 // ErrClientDisconnected is returned when the client disconnects during streaming.
 var ErrClientDisconnected = fmt.Errorf("client disconnected")
+
+// ErrStreamIdle is returned when no bytes arrive within idleTimeout on the
+// upstream stream. The connection is stale (e.g. backend hang or network
+// partition). The handler decides whether to fall back to another model.
+var ErrStreamIdle = fmt.Errorf("upstream stream idle")
+
+// IsIdleTimeout reports whether err is a read-timeout (network deadline
+// exceeded on an otherwise live stream).
+func IsIdleTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
+}
 
 // StreamHandler handles streaming SSE transformation from OpenAI to Anthropic format.
 type StreamHandler struct {
@@ -32,15 +55,23 @@ func NewStreamHandler() *StreamHandler {
 
 // ProxyStream takes an OpenAI streaming response and writes Anthropic-format SSE to the writer.
 // It reads OpenAI ChatCompletionChunk SSE events and transforms them into Anthropic MessageEvent SSE events.
-// The clientCtx is used to detect client disconnection and abort early.
+// The streamCtx is the per-model attempt context (carries streaming_timeout_ms); the caller
+// should wrap openaiResp with NewCtxReadCloser so the body read also respects the deadline.
 //
 // CRITICAL: This function reads directly from resp.Body without buffering to minimize latency.
 // Per deep research: "Don't use bufio.Scanner or bufio.Reader on the response body - it adds buffering"
+//
+// idleTimeout is the maximum gap between bytes on the upstream stream. The
+// stream lives as long as data keeps flowing; only an idle period longer than
+// idleTimeout is treated as a stuck connection and surfaces as ErrStreamIdle.
+// Pass 0 to disable (stream lives until EOF or error).
 func (h *StreamHandler) ProxyStream(
 	w http.ResponseWriter,
 	openaiResp io.ReadCloser,
 	originalModel string,
 	clientCtx context.Context,
+	idleTimeout time.Duration,
+	cancel context.CancelFunc,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -75,9 +106,16 @@ func (h *StreamHandler) ProxyStream(
 	stopSent := false
 	toolUseCount := 0
 	startedToolCalls := make(map[int]int) // maps OpenAI tool call index → Anthropic content block index
+	decodeErrors := 0                     // consecutive SSE decode failures
 
 	// Read in larger chunks for efficiency, then parse lines
 	readBuf := make([]byte, 4096)
+
+	// Start the idle watchdog. Each successful read pings the watchdog so
+	// the stream lives as long as data keeps flowing. If no bytes arrive
+	// within idleTimeout, cancel() is called, which aborts the upstream
+	// HTTP request and causes the next Read to return a context error.
+	ping := StartIdleWatchdog(clientCtx, cancel, idleTimeout)
 
 	for {
 		// Check if client disconnected
@@ -90,6 +128,9 @@ func (h *StreamHandler) ProxyStream(
 		// Read chunk from upstream
 		n, err := openaiResp.Read(readBuf)
 		if n > 0 {
+			// Data is flowing — reset the idle watchdog so the stream
+			// lives as long as data keeps arriving.
+			ping()
 			// Process bytes immediately
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
@@ -98,7 +139,7 @@ func (h *StreamHandler) ProxyStream(
 					lineBuf.Reset()
 
 					// Process complete line
-					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &toolUseCount, startedToolCalls, originalModel); err != nil {
+					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &toolUseCount, startedToolCalls, originalModel, &decodeErrors); err != nil {
 						return err
 					}
 				} else {
@@ -111,13 +152,22 @@ func (h *StreamHandler) ProxyStream(
 			// Process any remaining data in buffer
 			if lineBuf.Len() > 0 {
 				line := lineBuf.String()
-				if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &toolUseCount, startedToolCalls, originalModel); err != nil {
+				if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &toolUseCount, startedToolCalls, originalModel, &decodeErrors); err != nil {
 					return err
 				}
 			}
 			break
 		}
 		if err != nil {
+			if IsIdleTimeout(err) {
+				return ErrStreamIdle
+			}
+			// When the idle watchdog fires, it cancels the upstream context
+			// which produces context.Canceled on Read. Distinguish that
+			// from a client disconnect by checking clientCtx.
+			if (errors.Is(err, context.Canceled) || errors.Is(err, ErrStreamReadCanceled)) && clientCtx.Err() == nil {
+				return ErrStreamIdle
+			}
 			return fmt.Errorf("failed to read stream: %w", err)
 		}
 	}
@@ -150,12 +200,7 @@ func (h *StreamHandler) ProxyStream(
 			return entries[i].blockIdx < entries[j].blockIdx
 		})
 		for _, e := range entries {
-			idx := e.blockIdx
-			stopEvent := types.MessageEvent{
-				Type:  "content_block_stop",
-				Index: &idx,
-			}
-			if err := writeSSEEvent(w, stopEvent); err != nil {
+			if err := writeContentBlockStop(w, e.blockIdx); err != nil {
 				return ErrClientDisconnected
 			}
 		}
@@ -207,6 +252,7 @@ func (h *StreamHandler) processSSELine(
 	toolUseCount *int,
 	startedToolCalls map[int]int,
 	originalModel string,
+	decodeErrors *int,
 ) error {
 	line = strings.TrimSpace(line)
 
@@ -241,20 +287,29 @@ func (h *StreamHandler) processSSELine(
 		!strings.Contains(data, `"tool_calls"`) &&
 		!strings.Contains(data, `"usage"`) {
 		if idx := strings.Index(data, `"delta":{"content":"`); idx != -1 {
-			// Extract content directly
+			// Walk past JSON escape sequences to find the real closing
+			// quote. A naive strings.Index would stop at an escaped
+			// \" inside the content.
 			start := idx + len(`"delta":{"content":"`)
-			end := strings.Index(data[start:], `"`)
+			suffix := data[start:]
+			end := -1
+			for i := 0; i < len(suffix); i++ {
+				if suffix[i] == '\\' {
+					i++ // skip the escaped character
+					continue
+				}
+				if suffix[i] == '"' {
+					end = i
+					break
+				}
+			}
 			if end != -1 {
 				content := data[start : start+end]
 				if content != "" {
 					if !*contentStarted {
 						// If reasoning was already started, close it first
 						if *reasoningStarted {
-							stopEvent := types.MessageEvent{
-								Type:  "content_block_stop",
-								Index: contentIndex,
-							}
-							if err := writeSSEEvent(w, stopEvent); err != nil {
+							if err := writeContentBlockStop(w, *contentIndex); err != nil {
 								return ErrClientDisconnected
 							}
 							*contentIndex++
@@ -287,6 +342,10 @@ func (h *StreamHandler) processSSELine(
 					}
 					flusher.Flush()
 				}
+				// Valid SSE line accepted via fast path — reset the
+				// consecutive decode failure counter so interleaved valid
+				// chunks don't accumulate spurious "too many failures".
+				*decodeErrors = 0
 				return nil
 			}
 		}
@@ -295,9 +354,16 @@ func (h *StreamHandler) processSSELine(
 	// For tool calls and other complex cases, fall back to full JSON parsing
 	var chunk types.ChatCompletionChunk
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-		// Skip malformed chunks - don't fail the whole stream
+		// Track consecutive decode failures. A transient glitch is tolerated,
+		// but persistent corruption terminates the stream rather than silently
+		// dropping content.
+		*decodeErrors++
+		if *decodeErrors > 3 {
+			return fmt.Errorf("too many consecutive SSE decode failures (%d)", *decodeErrors)
+		}
 		return nil
 	}
+	*decodeErrors = 0
 
 	if len(chunk.Choices) == 0 {
 		if chunk.Usage != nil {
@@ -406,7 +472,11 @@ func (h *StreamHandler) processSSELine(
 		flusher.Flush()
 	}
 
-	// Handle streamed tool calls.
+	// Handle tool call deltas.
+	// OpenAI streams tool calls incrementally: the first chunk for a given
+	// tool call carries id + name (+ possibly empty arguments), subsequent
+	// chunks carry only incremental arguments.  We must create exactly one
+	// content_block_start per tool call, then stream deltas for it.
 	if len(choice.Delta.ToolCalls) > 0 {
 		for _, tc := range choice.Delta.ToolCalls {
 			oi := tc.Index // OpenAI tool_calls array index
@@ -414,10 +484,16 @@ func (h *StreamHandler) processSSELine(
 			blockIdx, exists := startedToolCalls[oi]
 			if !exists {
 				if tc.Function.Name == "" {
-					// Ignore recycled chunks with no name/id.
+					// Ghost chunk: this index was closed and recycled, but
+					// has no name/id. Ignore — the real tool call was
+					// already fully processed.
 					continue
 				}
-				if *contentStarted || *reasoningStarted {
+				// Close any existing content/reasoning block before opening the
+				// tool block.  Capture the state first so we know whether to
+				// advance contentIndex — the close itself clears the flags.
+				hadStartedBlock := *contentStarted || *reasoningStarted
+				if hadStartedBlock {
 					stopEvent := types.MessageEvent{
 						Type:  "content_block_stop",
 						Index: contentIndex,
@@ -427,11 +503,19 @@ func (h *StreamHandler) processSSELine(
 					}
 					*contentStarted = false
 					*reasoningStarted = false
+				}
+				// First time seeing this logical tool call — start a new block.
+				// Only increment contentIndex when a previous text or reasoning
+				// block was already started, OR when a prior tool call has already
+				// claimed index 0 (parallel or sequential tool calls).  If nothing
+				// was started yet (single-tool response), the first tool block
+				// keeps contentIndex at 0 so the Anthropic SSE content block
+				// indices are contiguous.
+				if hadStartedBlock || len(startedToolCalls) > 0 {
 					*contentIndex++
 				}
-				blockIdx = *contentIndex
-				*contentIndex++
 				*toolUseCount++
+				blockIdx = *contentIndex
 				startedToolCalls[oi] = blockIdx
 
 				toolID := tc.ID
@@ -453,6 +537,7 @@ func (h *StreamHandler) processSSELine(
 				}
 			}
 
+			// Send argument delta (if any) — whether new or continuation.
 			if tc.Function.Arguments != "" {
 				delta := types.Delta{
 					Type:        "input_json_delta",
@@ -569,6 +654,14 @@ func usageInfoToAnthropic(usage *types.UsageInfo) *types.Usage {
 	}
 }
 
+// writeContentBlockStop writes a content_block_stop SSE event at the given index.
+func writeContentBlockStop(w http.ResponseWriter, index int) error {
+	return writeSSEEvent(w, types.MessageEvent{
+		Type:  "content_block_stop",
+		Index: &index,
+	})
+}
+
 // writeSSEEvent writes a single SSE event to the HTTP response writer.
 // Format: "event: <type>\ndata: <json>\n\n"
 func writeSSEEvent(w http.ResponseWriter, event types.MessageEvent) error {
@@ -587,11 +680,15 @@ func generateID() string {
 }
 
 // ProxyResponsesStream takes an OpenAI Responses streaming response and writes Anthropic-format SSE.
+// streamCtx is the per-model attempt context (carries streaming_timeout_ms); the caller should
+// wrap responsesResp with NewCtxReadCloser so the body read also respects the deadline.
 func (h *StreamHandler) ProxyResponsesStream(
 	w http.ResponseWriter,
 	responsesResp io.ReadCloser,
 	originalModel string,
 	clientCtx context.Context,
+	idleTimeout time.Duration,
+	cancel context.CancelFunc,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -620,6 +717,8 @@ func (h *StreamHandler) ProxyResponsesStream(
 	stopSent := false
 	readBuf := make([]byte, 4096)
 
+	ping := StartIdleWatchdog(clientCtx, cancel, idleTimeout)
+
 	for {
 		select {
 		case <-clientCtx.Done():
@@ -629,6 +728,7 @@ func (h *StreamHandler) ProxyResponsesStream(
 
 		n, err := responsesResp.Read(readBuf)
 		if n > 0 {
+			ping()
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
 				if b == '\n' {
@@ -653,6 +753,12 @@ func (h *StreamHandler) ProxyResponsesStream(
 			break
 		}
 		if err != nil {
+			if IsIdleTimeout(err) {
+				return ErrStreamIdle
+			}
+			if (errors.Is(err, context.Canceled) || errors.Is(err, ErrStreamReadCanceled)) && clientCtx.Err() == nil {
+				return ErrStreamIdle
+			}
 			return fmt.Errorf("failed to read stream: %w", err)
 		}
 	}
@@ -765,11 +871,15 @@ func (h *StreamHandler) processResponsesSSELine(
 }
 
 // ProxyGeminiStream takes a Gemini streaming response and writes Anthropic-format SSE.
+// streamCtx is the per-model attempt context (carries streaming_timeout_ms); the caller should
+// wrap geminiResp with NewCtxReadCloser so the body read also respects the deadline.
 func (h *StreamHandler) ProxyGeminiStream(
 	w http.ResponseWriter,
 	geminiResp io.ReadCloser,
 	originalModel string,
 	clientCtx context.Context,
+	idleTimeout time.Duration,
+	cancel context.CancelFunc,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -798,6 +908,8 @@ func (h *StreamHandler) ProxyGeminiStream(
 	stopSent := false
 	readBuf := make([]byte, 4096)
 
+	ping := StartIdleWatchdog(clientCtx, cancel, idleTimeout)
+
 	for {
 		select {
 		case <-clientCtx.Done():
@@ -807,6 +919,7 @@ func (h *StreamHandler) ProxyGeminiStream(
 
 		n, err := geminiResp.Read(readBuf)
 		if n > 0 {
+			ping()
 			for i := 0; i < n; i++ {
 				b := readBuf[i]
 				if b == '\n' {
@@ -831,6 +944,12 @@ func (h *StreamHandler) ProxyGeminiStream(
 			break
 		}
 		if err != nil {
+			if IsIdleTimeout(err) {
+				return ErrStreamIdle
+			}
+			if (errors.Is(err, context.Canceled) || errors.Is(err, ErrStreamReadCanceled)) && clientCtx.Err() == nil {
+				return ErrStreamIdle
+			}
 			return fmt.Errorf("failed to read stream: %w", err)
 		}
 	}

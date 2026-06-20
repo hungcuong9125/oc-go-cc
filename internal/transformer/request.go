@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"strings"
 
-	"oc-go-cc/internal/config"
-	"oc-go-cc/pkg/types"
+	"github.com/routatic/proxy/internal/config"
+	"github.com/routatic/proxy/pkg/types"
 )
 
 // contentText is a convenience wrapper around types.TextContent for brevity
@@ -50,6 +50,17 @@ func isOpenAIReasoningModel(modelID string) bool {
 func needsPlaceholderReasoning(modelID string) bool {
 	// Moonshot's validator treats an empty string as missing.
 	return strings.HasPrefix(modelID, "kimi-")
+}
+
+// constrainTemperature overrides model-specific temperature constraints.
+// Some models require specific temperature values — return the constrained
+// value or the original if no constraint applies.
+func constrainTemperature(modelID string, temp float64) float64 {
+	// Moonshot AI (kimi-k2.7-code) only allows temperature=1.
+	if modelID == "kimi-k2.7-code" {
+		return 1.0
+	}
+	return temp
 }
 
 // stripCacheControl removes cache_control from all messages in the list.
@@ -100,9 +111,13 @@ func (t *RequestTransformer) TransformRequest(
 		openaiReq.MaxTokens = &maxTokens
 	}
 
-	// Apply model-specific overrides
+	// Apply model-specific overrides and temperature constraints
 	if model.Temperature > 0 {
 		openaiReq.Temperature = &model.Temperature
+	}
+	if openaiReq.Temperature != nil {
+		temp := constrainTemperature(model.ModelID, *openaiReq.Temperature)
+		openaiReq.Temperature = &temp
 	}
 	if model.MaxTokens > 0 {
 		maxTokens := model.MaxTokens
@@ -578,7 +593,7 @@ func (t *RequestTransformer) transformTools(tools []types.Tool) []types.ToolDef 
 		if name == "" {
 			continue
 		}
-
+		// InputSchema is already json.RawMessage, use it directly
 		schema := tool.InputSchema
 		switch {
 		case len(schema) == 0, string(schema) == "null", string(schema) == "{}":
@@ -588,14 +603,32 @@ func (t *RequestTransformer) transformTools(tools []types.Tool) []types.ToolDef 
 			if err := json.Unmarshal(schema, &schemaObj); err != nil {
 				schema = []byte(`{"type":"object","properties":{},"additionalProperties":false}`)
 			} else {
-				if _, ok := schemaObj["type"]; !ok {
-					schemaObj["type"] = "object"
-				}
-				if _, ok := schemaObj["properties"]; !ok {
-					schemaObj["properties"] = map[string]interface{}{}
-				}
-				if fixed, err := json.Marshal(schemaObj); err == nil {
-					schema = fixed
+				// Valid JSON " null " unmarshals to a nil map, which would panic
+				// on the field assignments below.
+				if schemaObj == nil {
+					schema = []byte(`{"type":"object","properties":{},"additionalProperties":false}`)
+				} else {
+					// Validate type field is "object" — otherwise OpenAI rejects the
+					// tool. A schema like {"type":"string"} passes unmarshal but
+					// produces a 400 from the upstream OpenAI-compatible endpoint.
+					schemaType, _ := schemaObj["type"].(string)
+					if schemaType != "object" {
+						schemaObj["type"] = "object"
+					}
+
+					// Validate properties is an object — wrong shapes like arrays
+					// or primitives also produce 400 errors upstream.
+					if props, ok := schemaObj["properties"]; ok {
+						if _, valid := props.(map[string]interface{}); !valid {
+							schemaObj["properties"] = map[string]interface{}{}
+						}
+					} else {
+						schemaObj["properties"] = map[string]interface{}{}
+					}
+
+					if fixed, err := json.Marshal(schemaObj); err == nil {
+						schema = fixed
+					}
 				}
 			}
 		}
